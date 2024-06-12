@@ -18,6 +18,16 @@ type nodeHandler struct {
 }
 
 func (nh *nodeHandler) addMessage(msg int) {
+	// check if msg is in local messages already and skip if true
+	nh.mux.RLock()
+	for i := range nh.messages {
+		if msg == i {
+			nh.mux.RUnlock()
+			return
+		}
+	}
+	nh.mux.RUnlock()
+
 	nh.mux.Lock()
 	nh.messages = append(nh.messages, msg)
 	log.Default().SetOutput(os.Stderr)
@@ -25,17 +35,35 @@ func (nh *nodeHandler) addMessage(msg int) {
 	nh.mux.Unlock()
 }
 
-func (nh *nodeHandler) broadcastToPeers(msgBody json.RawMessage) error {
+func (nh *nodeHandler) broadcastToPeers(msgBody json.RawMessage, src string) error {
 
 	if len(nh.topology) == 0 || len(nh.topology[nh.ID()]) == 0 {
 		return nil
 	}
 
 	eg := errgroup.Group{}
+	var err error
 	// WARN: this read of topology is not protected so can cause race conditions if it changes at run time
 	for _, peer := range nh.topology[nh.ID()] {
 		peer := peer
-		eg.Go(func() error { return nh.Send(peer, msgBody) })
+		if peer != src {
+			// if the source is another node, ensuring one more node gets the message is "good enough"
+			// otherwise keep sending to all connected peers
+			if src[0:1] != "n" {
+				eg.Go(func() error {
+					return nh.Send(peer, msgBody)
+				})
+			} else {
+				err = nh.Send(peer, msgBody)
+				if err == nil {
+					return nil
+				}
+			}
+		}
+	}
+
+	if err != nil {
+		return err
 	}
 
 	return eg.Wait()
@@ -55,7 +83,7 @@ func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
 	nh.addMessage(reqBody.Message)
 
-	go nh.broadcastToPeers(msg.Body)
+	go nh.broadcastToPeers(msg.Body, msg.Src)
 
 	respBody := make(map[string]any)
 	// update the message type for response
