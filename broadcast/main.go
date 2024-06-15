@@ -34,17 +34,18 @@ func (nh *nodeHandler) addMessage(msg int) {
 }
 
 func (nh *nodeHandler) broadcastToPeers() (err error) {
-	nh.mux.Lock()
-	defer nh.mux.Unlock()
 
 	syncAck := nh.syncAck
 	select {
 	case <-nh.ticker.C:
 		nh.syncAck = make(chan struct{})
 		close(syncAck)
-	case <-nh.syncAck:
+	case <-syncAck:
 		return nil
 	}
+
+	nh.mux.Lock()
+	defer nh.mux.Unlock()
 
 	if len(nh.topology) == 0 || len(nh.topology[nh.ID()]) == 0 {
 		return nil
@@ -107,7 +108,7 @@ func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
 	nh.addMessage(reqBody.Message)
 
-	nh.broadcastToPeers()
+	go nh.broadcastToPeers()
 
 	respBody := make(map[string]any)
 	// update the message type for response
@@ -162,7 +163,7 @@ func main() {
 	nh := nodeHandler{
 		maelstrom.NewNode(),
 		sync.RWMutex{},
-		*time.NewTicker(500 * time.Millisecond),
+		*time.NewTicker(100 * time.Millisecond),
 		make(chan struct{}),
 		make([]int, 0, 10),
 		make(map[int]struct{}),
