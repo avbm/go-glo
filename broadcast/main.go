@@ -5,7 +5,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/sync/errgroup"
@@ -14,8 +13,6 @@ import (
 type nodeHandler struct {
 	*maelstrom.Node
 	mux            sync.RWMutex
-	ticker         time.Ticker
-	syncAck        chan struct{}
 	messages       []int
 	messageSources map[int]struct{}
 	topology       map[string][]string
@@ -34,15 +31,6 @@ func (nh *nodeHandler) addMessage(msg int) {
 }
 
 func (nh *nodeHandler) broadcastToPeers() (err error) {
-
-	syncAck := nh.syncAck
-	select {
-	case <-nh.ticker.C:
-		nh.syncAck = make(chan struct{})
-		close(syncAck)
-	case <-syncAck:
-		return nil
-	}
 
 	nh.mux.Lock()
 	defer nh.mux.Unlock()
@@ -108,7 +96,7 @@ func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
 	nh.addMessage(reqBody.Message)
 
-	go nh.broadcastToPeers()
+	nh.broadcastToPeers()
 
 	respBody := make(map[string]any)
 	// update the message type for response
@@ -163,14 +151,10 @@ func main() {
 	nh := nodeHandler{
 		maelstrom.NewNode(),
 		sync.RWMutex{},
-		*time.NewTicker(100 * time.Millisecond),
-		make(chan struct{}),
 		make([]int, 0, 10),
 		make(map[int]struct{}),
 		nil,
 	}
-
-	defer nh.ticker.Stop()
 
 	nh.Handle("broadcast", nh.broadcastHandler)
 	nh.Handle("read", nh.readHandler)
