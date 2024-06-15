@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -18,39 +17,19 @@ type nodeHandler struct {
 	ticker         time.Ticker
 	syncAck        chan struct{}
 	messages       []int
-	messageSources map[int][]string
+	messageSources map[int]struct{}
 	topology       map[string][]string
 }
 
-func (nh *nodeHandler) addMessageSource(msg int, src string) {
-	// we dont use locks here since it should be locked by calling function
-	if sources, ok := nh.messageSources[msg]; ok {
-		// check if source already in sources
-		for _, s := range sources {
-			if s == src {
-				return
-			}
-		}
-
-		// if not, append
-		nh.messageSources[msg] = append(sources, src)
-		return
-	}
-	// create a new entry since one doesnt exist
-	nh.messageSources[msg] = []string{src}
-	return
-}
-
-func (nh *nodeHandler) addMessage(msg int, src string) {
+func (nh *nodeHandler) addMessage(msg int) {
 	// check if msg is in local messages already and skip if true
 	nh.mux.Lock()
 	defer nh.mux.Unlock()
 	if _, ok := nh.messageSources[msg]; ok {
-		nh.addMessageSource(msg, src)
 		return
 	}
 	nh.messages = append(nh.messages, msg)
-	nh.addMessageSource(msg, src)
+	nh.messageSources[msg] = struct{}{}
 	log.Printf("DEBUG: messages: %v, new message: %d", nh.messages, msg)
 }
 
@@ -72,9 +51,6 @@ func (nh *nodeHandler) broadcastToPeers() (err error) {
 	}
 
 	eg := errgroup.Group{}
-	// for each peer check if it is not a known source of a message.
-	// if not, add it to the request and sync all messages
-	//for _, peer := range nh.topology[nh.Node.ID()] {
 	for peer := range nh.topology {
 		if peer == nh.ID() {
 			continue
@@ -83,28 +59,15 @@ func (nh *nodeHandler) broadcastToPeers() (err error) {
 			ReqType:  "sync",
 			Messages: nh.messages,
 		}
-		/*
-			for msg, sources := range nh.messageSources {
-				knownSource := false
-				for _, s := range sources {
-					if s == peer {
-						knownSource = true
-						break
-					}
-				}
-				if !knownSource {
-					req.Messages = append(req.Messages, msg)
-				}
-			}
-		*/
-		if len(req.Messages) != 0 {
-			err := nh.Node.RPC(peer, req, nh.syncOkHandler)
+		peer := peer
+		eg.Go(func() error {
+			err := nh.Node.Send(peer, req)
 
 			if err != nil {
 				log.Printf("ERROR: failed to sync to peer: %s. error: %s", peer, err)
-				continue
 			}
-		}
+			return err
+		})
 	}
 
 	return eg.Wait()
@@ -113,27 +76,6 @@ func (nh *nodeHandler) broadcastToPeers() (err error) {
 type syncRequest struct {
 	ReqType  string `json:"type"`
 	Messages []int  `json:"messages"`
-}
-
-func (nh *nodeHandler) syncOkHandler(msg maelstrom.Message) error {
-
-	var body syncRequest
-	if err := json.Unmarshal(msg.Body, &body); err != nil {
-		log.Printf("ERROR: failed to sync to peer: %s. error: %s", msg.Src, err)
-		return err
-	}
-	if body.ReqType != "sync_ok" {
-		return fmt.Errorf("unexpected response to sync: %v", body)
-	}
-
-	// if delivery was successful, add to known peers
-	nh.mux.Lock()
-	log.Printf("DEBUG: received sync_ok from: %s, topology: %v", msg.Src, nh.topology)
-	for _, m := range body.Messages {
-		nh.messageSources[m] = append(nh.messageSources[m], msg.Src)
-	}
-	nh.mux.Unlock()
-	return nil
 }
 
 func (nh *nodeHandler) syncHandler(msg maelstrom.Message) error {
@@ -145,15 +87,10 @@ func (nh *nodeHandler) syncHandler(msg maelstrom.Message) error {
 
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
 	for _, m := range reqBody.Messages {
-		nh.addMessage(m, msg.Src)
+		nh.addMessage(m)
 	}
 
-	respBody := syncRequest{
-		ReqType:  "sync_ok",
-		Messages: reqBody.Messages,
-	}
-
-	return nh.Reply(msg, respBody)
+	return nil
 }
 
 func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
@@ -168,7 +105,7 @@ func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
 	}
 
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
-	nh.addMessage(reqBody.Message, msg.Src)
+	nh.addMessage(reqBody.Message)
 
 	nh.broadcastToPeers()
 
@@ -228,7 +165,7 @@ func main() {
 		*time.NewTicker(500 * time.Millisecond),
 		make(chan struct{}),
 		make([]int, 0, 10),
-		make(map[int][]string),
+		make(map[int]struct{}),
 		nil,
 	}
 
