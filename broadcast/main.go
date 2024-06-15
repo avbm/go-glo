@@ -63,8 +63,10 @@ func (nh *nodeHandler) broadcastToPeers() error {
 	eg := errgroup.Group{}
 	// for each peer check if it is not a known source of a message.
 	// if not, add it to the request and sync all messages
-	mux := sync.Mutex{}
-	for _, peer := range nh.topology[nh.ID()] {
+	for peer, _ := range nh.topology {
+		if peer == nh.ID() {
+			continue
+		}
 		req := syncRequest{
 			ReqType:  "sync",
 			Messages: nh.messages,
@@ -84,29 +86,8 @@ func (nh *nodeHandler) broadcastToPeers() error {
 			}
 		*/
 		if len(req.Messages) != 0 {
-			err := nh.Node.RPC(peer, req, func(msg maelstrom.Message) error {
-				type request struct {
-					ReqType string `json:"type"`
-				}
-				var body request
-				if err := json.Unmarshal(msg.Body, &body); err != nil {
-					log.Printf("ERROR: failed to sync to peer: %s. error: %s", peer, err)
-					return err
-				}
-				if body.ReqType != "sync_ok" {
-					return fmt.Errorf("unexpected response to sync: %v", body)
-				}
+			err := nh.Node.Send(peer, req)
 
-				// if delivery was successful, add to known peers
-				mux.Lock()
-				for _, msg := range req.Messages {
-					//TODO find source of concurrent map write
-					nh.messageSources[msg] = append(nh.messageSources[msg], peer)
-				}
-				mux.Unlock()
-				return nil
-
-			})
 			if err != nil {
 				log.Printf("ERROR: failed to sync to peer: %s. error: %s", peer, err)
 				continue
@@ -122,6 +103,27 @@ type syncRequest struct {
 	Messages []int  `json:"messages"`
 }
 
+func (nh *nodeHandler) syncOkHandler(msg maelstrom.Message) error {
+
+	var body syncRequest
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		log.Printf("ERROR: failed to sync to peer: %s. error: %s", msg.Src, err)
+		return err
+	}
+	if body.ReqType != "sync_ok" {
+		return fmt.Errorf("unexpected response to sync: %v", body)
+	}
+
+	// if delivery was successful, add to known peers
+	nh.mux.Lock()
+	for _, m := range body.Messages {
+		//TODO find source of concurrent map write
+		nh.messageSources[m] = append(nh.messageSources[m], msg.Src)
+	}
+	nh.mux.Unlock()
+	return nil
+}
+
 func (nh *nodeHandler) syncHandler(msg maelstrom.Message) error {
 
 	var reqBody syncRequest
@@ -134,9 +136,10 @@ func (nh *nodeHandler) syncHandler(msg maelstrom.Message) error {
 		nh.addMessage(m, msg.Src)
 	}
 
-	respBody := make(map[string]any)
-	// update the message type for response
-	respBody["type"] = "sync_ok"
+	respBody := syncRequest{
+		ReqType:  "sync_ok",
+		Messages: reqBody.Messages,
+	}
 
 	return nh.Reply(msg, respBody)
 }
