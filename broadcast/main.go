@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -12,61 +13,132 @@ import (
 
 type nodeHandler struct {
 	*maelstrom.Node
-	messages []int
-	mux      sync.RWMutex
-	topology map[string][]string
+	mux            sync.RWMutex
+	messages       []int
+	messageSources map[int][]string
+	topology       map[string][]string
 }
 
-func (nh *nodeHandler) addMessage(msg int) {
-	// check if msg is in local messages already and skip if true
-	nh.mux.RLock()
-	for i := range nh.messages {
-		if msg == i {
-			nh.mux.RUnlock()
-			return
+func (nh *nodeHandler) addMessageSource(msg int, src string) {
+	// we dont use locks here since it should be locked by calling function
+	if sources, ok := nh.messageSources[msg]; ok {
+		// check if source already in sources
+		for _, s := range sources {
+			if s == src {
+				return
+			}
 		}
-	}
-	nh.mux.RUnlock()
 
-	nh.mux.Lock()
-	nh.messages = append(nh.messages, msg)
-	log.Default().SetOutput(os.Stderr)
-	log.Printf("DEBUG: messages: %v, new message: %d", nh.messages, msg)
-	nh.mux.Unlock()
+		// if not, append
+		nh.messageSources[msg] = append(sources, src)
+		return
+	}
+	// create a new entry since one doesnt exist
+	nh.messageSources[msg] = []string{src}
+	return
 }
 
-func (nh *nodeHandler) broadcastToPeers(msgBody json.RawMessage, src string) error {
+func (nh *nodeHandler) addMessage(msg int, src string) {
+	// check if msg is in local messages already and skip if true
+	nh.mux.Lock()
+	defer nh.mux.Unlock()
+	if _, ok := nh.messageSources[msg]; ok {
+		nh.addMessageSource(msg, src)
+		return
+	}
+	nh.messages = append(nh.messages, msg)
+	nh.addMessageSource(msg, src)
+	log.Printf("DEBUG: messages: %v, new message: %d", nh.messages, msg)
+}
+
+func (nh *nodeHandler) broadcastToPeers() error {
 
 	if len(nh.topology) == 0 || len(nh.topology[nh.ID()]) == 0 {
 		return nil
 	}
 
+	nh.mux.Lock()
+	defer nh.mux.Unlock()
+
 	eg := errgroup.Group{}
-	var err error
-	// WARN: this read of topology is not protected so can cause race conditions if it changes at run time
+	// for each peer check if it is not a known source of a message.
+	// if not, add it to the request and sync all messages
+	mux := sync.Mutex{}
 	for _, peer := range nh.topology[nh.ID()] {
-		peer := peer
-		if peer != src {
-			// if the source is another node, ensuring one more node gets the message is "good enough"
-			// otherwise keep sending to all connected peers
-			if src[0:1] != "n" {
-				eg.Go(func() error {
-					return nh.Send(peer, msgBody)
-				})
-			} else {
-				err = nh.Send(peer, msgBody)
-				if err == nil {
-					return nil
+		req := syncRequest{
+			ReqType:  "sync",
+			Messages: nh.messages,
+		}
+		/*
+			for msg, sources := range nh.messageSources {
+				knownSource := false
+				for _, s := range sources {
+					if s == peer {
+						knownSource = true
+						break
+					}
 				}
+				if !knownSource {
+					req.Messages = append(req.Messages, msg)
+				}
+			}
+		*/
+		if len(req.Messages) != 0 {
+			err := nh.Node.RPC(peer, req, func(msg maelstrom.Message) error {
+				type request struct {
+					ReqType string `json:"type"`
+				}
+				var body request
+				if err := json.Unmarshal(msg.Body, &body); err != nil {
+					log.Printf("ERROR: failed to sync to peer: %s. error: %s", peer, err)
+					return err
+				}
+				if body.ReqType != "sync_ok" {
+					return fmt.Errorf("unexpected response to sync: %v", body)
+				}
+
+				// if delivery was successful, add to known peers
+				mux.Lock()
+				for _, msg := range req.Messages {
+					//TODO find source of concurrent map write
+					nh.messageSources[msg] = append(nh.messageSources[msg], peer)
+				}
+				mux.Unlock()
+				return nil
+
+			})
+			if err != nil {
+				log.Printf("ERROR: failed to sync to peer: %s. error: %s", peer, err)
+				continue
 			}
 		}
 	}
 
-	if err != nil {
+	return eg.Wait()
+}
+
+type syncRequest struct {
+	ReqType  string `json:"type"`
+	Messages []int  `json:"messages"`
+}
+
+func (nh *nodeHandler) syncHandler(msg maelstrom.Message) error {
+
+	var reqBody syncRequest
+	if err := json.Unmarshal(msg.Body, &reqBody); err != nil {
 		return err
 	}
 
-	return eg.Wait()
+	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
+	for _, m := range reqBody.Messages {
+		nh.addMessage(m, msg.Src)
+	}
+
+	respBody := make(map[string]any)
+	// update the message type for response
+	respBody["type"] = "sync_ok"
+
+	return nh.Reply(msg, respBody)
 }
 
 func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
@@ -81,9 +153,9 @@ func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
 	}
 
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
-	nh.addMessage(reqBody.Message)
+	nh.addMessage(reqBody.Message, msg.Src)
 
-	go nh.broadcastToPeers(msg.Body, msg.Src)
+	go nh.broadcastToPeers()
 
 	respBody := make(map[string]any)
 	// update the message type for response
@@ -128,7 +200,6 @@ func (nh *nodeHandler) topologyHandler(msg maelstrom.Message) error {
 	// update the message type for response
 	respBody["type"] = "topology_ok"
 
-	// TODO - likely we need to read topology and do something with it later
 	return nh.Reply(msg, respBody)
 }
 
@@ -138,14 +209,17 @@ func main() {
 
 	nh := nodeHandler{
 		maelstrom.NewNode(),
-		make([]int, 0, 10),
 		sync.RWMutex{},
+		make([]int, 0, 10),
+		make(map[int][]string),
 		nil,
 	}
 
 	nh.Handle("broadcast", nh.broadcastHandler)
 	nh.Handle("read", nh.readHandler)
 	nh.Handle("topology", nh.topologyHandler)
+	nh.Handle("sync", nh.syncHandler)
+	nh.Handle("sync_ok", func(maelstrom.Message) error { return nil })
 
 	if err := nh.Run(); err != nil {
 		log.Fatal(err)
