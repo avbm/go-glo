@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 	"golang.org/x/sync/errgroup"
@@ -14,6 +15,8 @@ import (
 type nodeHandler struct {
 	*maelstrom.Node
 	mux            sync.RWMutex
+	ticker         time.Ticker
+	syncAck        chan struct{}
 	messages       []int
 	messageSources map[int][]string
 	topology       map[string][]string
@@ -51,19 +54,28 @@ func (nh *nodeHandler) addMessage(msg int, src string) {
 	log.Printf("DEBUG: messages: %v, new message: %d", nh.messages, msg)
 }
 
-func (nh *nodeHandler) broadcastToPeers() error {
+func (nh *nodeHandler) broadcastToPeers() (err error) {
+	nh.mux.Lock()
+	defer nh.mux.Unlock()
+
+	syncAck := nh.syncAck
+	select {
+	case <-nh.ticker.C:
+		nh.syncAck = make(chan struct{})
+		close(syncAck)
+	case <-nh.syncAck:
+		return nil
+	}
 
 	if len(nh.topology) == 0 || len(nh.topology[nh.ID()]) == 0 {
 		return nil
 	}
 
-	nh.mux.Lock()
-	defer nh.mux.Unlock()
-
 	eg := errgroup.Group{}
 	// for each peer check if it is not a known source of a message.
 	// if not, add it to the request and sync all messages
-	for peer, _ := range nh.topology {
+	//for _, peer := range nh.topology[nh.Node.ID()] {
+	for peer := range nh.topology {
 		if peer == nh.ID() {
 			continue
 		}
@@ -86,7 +98,7 @@ func (nh *nodeHandler) broadcastToPeers() error {
 			}
 		*/
 		if len(req.Messages) != 0 {
-			err := nh.Node.Send(peer, req)
+			err := nh.Node.RPC(peer, req, nh.syncOkHandler)
 
 			if err != nil {
 				log.Printf("ERROR: failed to sync to peer: %s. error: %s", peer, err)
@@ -116,8 +128,8 @@ func (nh *nodeHandler) syncOkHandler(msg maelstrom.Message) error {
 
 	// if delivery was successful, add to known peers
 	nh.mux.Lock()
+	log.Printf("DEBUG: received sync_ok from: %s, topology: %v", msg.Src, nh.topology)
 	for _, m := range body.Messages {
-		//TODO find source of concurrent map write
 		nh.messageSources[m] = append(nh.messageSources[m], msg.Src)
 	}
 	nh.mux.Unlock()
@@ -158,7 +170,7 @@ func (nh *nodeHandler) broadcastHandler(msg maelstrom.Message) error {
 	log.Printf("DEBUG: received request: %v, raw: %s", reqBody, msg)
 	nh.addMessage(reqBody.Message, msg.Src)
 
-	go nh.broadcastToPeers()
+	nh.broadcastToPeers()
 
 	respBody := make(map[string]any)
 	// update the message type for response
@@ -213,10 +225,14 @@ func main() {
 	nh := nodeHandler{
 		maelstrom.NewNode(),
 		sync.RWMutex{},
+		*time.NewTicker(500 * time.Millisecond),
+		make(chan struct{}),
 		make([]int, 0, 10),
 		make(map[int][]string),
 		nil,
 	}
+
+	defer nh.ticker.Stop()
 
 	nh.Handle("broadcast", nh.broadcastHandler)
 	nh.Handle("read", nh.readHandler)
